@@ -1,0 +1,436 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * show-dependencies
+ *
+ * Reads composer.json for declared require / require-dev,
+ * resolves actual installed versions from composer.lock (preferred)
+ * or vendor/ directory, then outputs:
+ *   - a human-readable table
+ *   - a JSON excerpt ready to paste back into composer.json
+ *
+ * Platform requirements (php, ext-*, lib-*, hhvm, …) are kept in the
+ * output as-is with their original declared constraint, since they have
+ * no vendor/ entry to resolve against.
+ *
+ * Compatible with PHP 5.6 – 8.x
+ *
+ * @license MIT
+ * @author  Francisco Ernesto Teixeira <https://github.com/franciscoernestoteixeira>
+ */
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+define('SD_ROOT',          getcwd());
+define('SD_COMPOSER_JSON', SD_ROOT . DIRECTORY_SEPARATOR . 'composer.json');
+define('SD_COMPOSER_LOCK', SD_ROOT . DIRECTORY_SEPARATOR . 'composer.lock');
+define('SD_VENDOR_DIR',    SD_ROOT . DIRECTORY_SEPARATOR . 'vendor');
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Print an error message to STDERR and exit with code 1.
+ *
+ * @param string $msg
+ * @return void
+ */
+function sd_error($msg)
+{
+    fwrite(STDERR, $msg . PHP_EOL);
+    exit(1);
+}
+
+/**
+ * Read and JSON-decode a file. Returns null on any failure.
+ *
+ * @param  string $file
+ * @return array|null
+ */
+function sd_read_json($file)
+{
+    $raw = @file_get_contents($file);
+    if ($raw === false) {
+        return null;
+    }
+
+    $decoded = json_decode($raw, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        return null;
+    }
+
+    return $decoded;
+}
+
+/**
+ * Returns true for platform requirements that have no vendor/ package
+ * (php, ext-*, lib-*, hhvm, php-64bit, etc.).
+ *
+ * @param  string $name
+ * @return bool
+ */
+function sd_is_platform($name)
+{
+    return $name === 'php'
+        || $name === 'hhvm'
+        || strpos($name, 'php-')  === 0
+        || strpos($name, 'ext-')  === 0
+        || strpos($name, 'lib-')  === 0;
+}
+
+/**
+ * Remove a leading "v" / "V" from a version string, if present.
+ *
+ * @param  string $version
+ * @return string
+ */
+function sd_strip_v($version)
+{
+    if (isset($version[0]) && ($version[0] === 'v' || $version[0] === 'V')) {
+        return substr($version, 1);
+    }
+    return $version;
+}
+
+// ── Version resolution ────────────────────────────────────────────────────────
+
+/**
+ * Collect installed versions from composer.lock (the most reliable source).
+ * Merges packages + packages-dev sections.
+ *
+ * @param  array $wantedNames   Flat list of package names to look up.
+ * @return array                name => version
+ */
+function sd_collect_from_lock(array $wantedNames)
+{
+    $lock = sd_read_json(SD_COMPOSER_LOCK);
+    if (!is_array($lock)) {
+        return array();
+    }
+
+    $packages = array();
+
+    if (isset($lock['packages']) && is_array($lock['packages'])) {
+        foreach ($lock['packages'] as $p) {
+            $packages[] = $p;
+        }
+    }
+    if (isset($lock['packages-dev']) && is_array($lock['packages-dev'])) {
+        foreach ($lock['packages-dev'] as $p) {
+            $packages[] = $p;
+        }
+    }
+
+    $found = array();
+
+    foreach ($packages as $pkg) {
+        $name    = isset($pkg['name'])    ? (string) $pkg['name']    : '';
+        $version = isset($pkg['version']) ? (string) $pkg['version'] : '';
+
+        if ($name === '' || $version === '') {
+            continue;
+        }
+        if (!in_array($name, $wantedNames, true)) {
+            continue;
+        }
+
+        $found[$name] = sd_strip_v($version);
+    }
+
+    return $found;
+}
+
+/**
+ * Walk vendor/ searching for composer.json files to collect versions.
+ * When the same package appears at multiple depths (e.g. a nested
+ * dependency that also appears at the root), the shallowest copy wins.
+ *
+ * @param  array $wantedNames
+ * @return array                name => version
+ */
+function sd_collect_from_vendor(array $wantedNames)
+{
+    if (!is_dir(SD_VENDOR_DIR)) {
+        return array();
+    }
+
+    // name => array('version' => string, 'depth' => int)
+    $seen  = array();
+    $stack = array(SD_VENDOR_DIR);
+
+    while (!empty($stack)) {
+        $dir     = array_pop($stack);
+        $entries = @scandir($dir);
+
+        if ($entries === false) {
+            continue;
+        }
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+
+            $full  = $dir . DIRECTORY_SEPARATOR . $entry;
+            $lower = strtolower($entry);
+
+            if (is_dir($full)) {
+                // Skip hidden / cache directories
+                if ($lower === '.git' || $lower === '.cache') {
+                    continue;
+                }
+                $stack[] = $full;
+
+            } elseif ($entry === 'composer.json') {
+                $pkg = sd_read_json($full);
+                if (!is_array($pkg)) {
+                    continue;
+                }
+
+                $name    = isset($pkg['name'])    ? (string) $pkg['name']    : '';
+                $version = isset($pkg['version']) ? (string) $pkg['version'] : '';
+
+                if ($name === '' || $version === '') {
+                    continue;
+                }
+                if (!in_array($name, $wantedNames, true)) {
+                    continue;
+                }
+
+                // Depth relative to vendor root
+                $rel   = substr($full, strlen(SD_VENDOR_DIR));
+                $depth = substr_count($rel, DIRECTORY_SEPARATOR);
+
+                $version = sd_strip_v($version);
+
+                if (!isset($seen[$name]) || $depth < $seen[$name]['depth']) {
+                    $seen[$name] = array('version' => $version, 'depth' => $depth);
+                }
+            }
+        }
+    }
+
+    $result = array();
+    foreach ($seen as $name => $info) {
+        $result[$name] = $info['version'];
+    }
+
+    return $result;
+}
+
+// ── Output ────────────────────────────────────────────────────────────────────
+
+/**
+ * Print a fixed-width table to STDOUT.
+ *
+ * Each row: array('name' => string, 'version' => string, 'platform' => bool)
+ * Platform rows are annotated with "(declared)" in the version column so the
+ * reader knows those values come directly from composer.json, not from a
+ * resolved install.
+ *
+ * @param  array $rows
+ * @return void
+ */
+function sd_print_table(array $rows)
+{
+    $nameWidth = strlen('name');
+    $verWidth  = strlen('version');
+
+    foreach ($rows as $r) {
+        $displayVersion = $r['version'] . (empty($r['platform']) ? '' : '  (declared)');
+        if (strlen($r['name'])      > $nameWidth) { $nameWidth = strlen($r['name']);      }
+        if (strlen($displayVersion) > $verWidth)  { $verWidth  = strlen($displayVersion); }
+    }
+
+    $pad = function ($s, $w) {
+        return $s . str_repeat(' ', max(0, $w - strlen($s)));
+    };
+
+    echo $pad('name', $nameWidth) . '  ' . $pad('version', $verWidth) . PHP_EOL;
+    echo str_repeat('-', $nameWidth) . '  ' . str_repeat('-', $verWidth) . PHP_EOL;
+
+    foreach ($rows as $r) {
+        $displayVersion = $r['version'] . (empty($r['platform']) ? '' : '  (declared)');
+        echo $pad($r['name'], $nameWidth) . '  ' . $pad($displayVersion, $verWidth) . PHP_EOL;
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+// 1. Verify we are in a Composer project root
+if (!file_exists(SD_COMPOSER_JSON)) {
+    sd_error('❌  composer.json not found in the current directory.');
+}
+
+// 2. Parse root composer.json
+$rootPkg = sd_read_json(SD_COMPOSER_JSON);
+if (!is_array($rootPkg)) {
+    sd_error('❌  Could not parse composer.json.');
+}
+
+$rootRequire    = (isset($rootPkg['require'])     && is_array($rootPkg['require']))     ? $rootPkg['require']     : array();
+$rootRequireDev = (isset($rootPkg['require-dev']) && is_array($rootPkg['require-dev'])) ? $rootPkg['require-dev'] : array();
+
+// 3. Separate platform constraints (php, ext-*, lib-*, hhvm …) from real packages.
+//    Platform entries have no vendor/ directory to resolve against, so we keep
+//    them verbatim with their original declared constraint and pass them straight
+//    through to the output unchanged.
+$platformRequire    = array();
+$platformRequireDev = array();
+
+foreach (array_keys($rootRequire) as $k) {
+    if (sd_is_platform($k)) {
+        $platformRequire[$k] = $rootRequire[$k];
+        unset($rootRequire[$k]);
+    }
+}
+foreach (array_keys($rootRequireDev) as $k) {
+    if (sd_is_platform($k)) {
+        $platformRequireDev[$k] = $rootRequireDev[$k];
+        unset($rootRequireDev[$k]);
+    }
+}
+
+$wantedNames = array_merge(array_keys($rootRequire), array_keys($rootRequireDev));
+
+// It is valid to have only platform requirements — still produce output for them.
+if (empty($wantedNames) && empty($platformRequire) && empty($platformRequireDev)) {
+    echo 'No dependencies declared in composer.json.' . PHP_EOL;
+    exit(0);
+}
+
+// 4. Resolve versions — composer.lock first, then vendor/ scan as fallback
+$installedMap = array();
+$usedSource   = null;
+
+if (!empty($wantedNames)) {
+    if (file_exists(SD_COMPOSER_LOCK)) {
+        $installedMap = sd_collect_from_lock($wantedNames);
+        $usedSource   = 'composer.lock';
+    }
+
+    // Supplement with vendor/ for anything the lock didn't cover (or when no lock exists)
+    $vendorMap = sd_collect_from_vendor($wantedNames);
+    foreach ($vendorMap as $name => $version) {
+        if (!isset($installedMap[$name])) {
+            $installedMap[$name] = $version;
+            if ($usedSource === null) {
+                $usedSource = 'vendor/';
+            }
+        }
+    }
+
+    if ($usedSource === null) {
+        $usedSource = 'vendor/ (not found)';
+    }
+}
+
+// 5. Build the row list.
+//
+//    Layout:
+//      a) Platform entries (require)     — original declared order, original constraint
+//      b) Platform entries (require-dev) — original declared order, original constraint
+//      c) Resolved packages              — sorted alphabetically
+//
+//    This mirrors the typical composer.json structure where php/ext-* come first.
+
+$rows       = array();
+$newRequire = array();
+$newDev     = array();
+$missing    = array();
+
+// (a) Platform — require
+foreach ($platformRequire as $name => $constraint) {
+    $rows[]            = array('name' => $name, 'version' => $constraint, 'platform' => true);
+    $newRequire[$name] = $constraint;
+}
+
+// (b) Platform — require-dev
+foreach ($platformRequireDev as $name => $constraint) {
+    $rows[]        = array('name' => $name, 'version' => $constraint, 'platform' => true);
+    $newDev[$name] = $constraint;
+}
+
+// (c) Resolved packages — sorted
+$allPackageEntries = array();
+foreach (array_keys($rootRequire) as $n) {
+    $allPackageEntries[] = array('name' => $n, 'kind' => 'require');
+}
+foreach (array_keys($rootRequireDev) as $n) {
+    $allPackageEntries[] = array('name' => $n, 'kind' => 'require-dev');
+}
+
+usort($allPackageEntries, function ($a, $b) {
+    return strcasecmp($a['name'], $b['name']);
+});
+
+foreach ($allPackageEntries as $entry) {
+    $name = $entry['name'];
+    $kind = $entry['kind'];
+
+    if (isset($installedMap[$name])) {
+        $version = $installedMap[$name];
+        $rows[]  = array('name' => $name, 'version' => $version, 'platform' => false);
+
+        if ($kind === 'require') {
+            $newRequire[$name] = $version;
+        } else {
+            $newDev[$name] = $version;
+        }
+    } else {
+        $missing[] = $name;
+    }
+}
+
+// 6. Output
+
+$hasPackageRows = !empty($installedMap) || !empty($platformRequire) || !empty($platformRequireDev);
+
+if (!$hasPackageRows && empty($rows)) {
+    fwrite(STDERR, 'No matching installed packages found' . ($usedSource ? ' in ' . $usedSource : '') . PHP_EOL);
+
+    if (!empty($missing)) {
+        fwrite(STDERR, PHP_EOL . 'Declared but not found:' . PHP_EOL);
+        foreach ($missing as $n) {
+            fwrite(STDERR, ' - ' . $n . PHP_EOL);
+        }
+    }
+
+    exit(1);
+}
+
+// Source note (only relevant for resolved packages)
+if ($usedSource !== null) {
+    echo '// Source (resolved packages): ' . $usedSource . PHP_EOL . PHP_EOL;
+} else {
+    echo PHP_EOL;
+}
+
+// Table
+sd_print_table($rows);
+
+// JSON excerpt
+$excerpt = array();
+if (!empty($newRequire)) {
+    $excerpt['require'] = $newRequire;
+}
+if (!empty($newDev)) {
+    $excerpt['require-dev'] = $newDev;
+}
+
+$flags = JSON_PRETTY_PRINT;
+// JSON_UNESCAPED_SLASHES is available from PHP 5.4 onward
+if (defined('JSON_UNESCAPED_SLASHES')) {
+    $flags = $flags | JSON_UNESCAPED_SLASHES;
+}
+
+echo PHP_EOL . '// --- Paste into your composer.json ---' . PHP_EOL;
+echo json_encode($excerpt, $flags) . PHP_EOL;
+
+// Report any declared packages that could not be resolved
+if (!empty($missing)) {
+    echo PHP_EOL . '// Declared but not found in ' . $usedSource . ':' . PHP_EOL;
+    foreach ($missing as $n) {
+        echo '// - ' . $n . PHP_EOL;
+    }
+}

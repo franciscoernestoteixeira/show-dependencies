@@ -1,0 +1,32 @@
+{
+    "name": "franciscoernestoteixeira/show-dependencies",
+    "description": "CLI tool to list installed Composer dependencies with their actual installed versions (from composer.lock or vendor/).",
+    "keywords": [
+        "composer",
+        "dependencies",
+        "versions",
+        "cli",
+        "packagist",
+        "lock"
+    ],
+    "homepage": "https://github.com/franciscoernestoteixeira/show-dependencies",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Francisco Ernesto Teixeira",
+            "homepage": "https://github.com/franciscoernestoteixeira",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": ">=5.6"
+    },
+    "bin": [
+        "bin/show-dependencies"
+    ],
+    "support": {
+        "issues": "https://github.com/franciscoernestoteixeira/show-dependencies/issues",
+        "source": "https://github.com/franciscoernestoteixeira/show-dependencies"
+    }
+}
