@@ -16,6 +16,47 @@ This tool reads `composer.lock` when available, or falls back to scanning `vendo
 
 ---
 
+## Usage
+
+Install:
+
+```bash
+composer global require franciscoernestoteixeira/show-dependencies
+```
+
+Run:
+
+```bash
+composer global config bin-dir --absolute
+```
+
+Probably it will return something like:
+
+```bash
+/Users/francisco/.composer/vendor/bin
+```
+
+Test directly:
+
+```bash
+$HOME/.composer/vendor/bin/show-dependencies
+```
+
+Then fix your ~/.zshrc:
+
+```bash
+echo 'export PATH="$PATH:$HOME/.composer/vendor/bin"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Now test:
+
+```bash
+show-dependencies
+```
+
+---
+
 ## Requirements
 
 | Requirement | Minimum version |
